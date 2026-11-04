@@ -40,6 +40,7 @@ WHEEL_JOINTS = [
 ]
 ACTIVE_JOINTS = LEG_JOINTS + WHEEL_JOINTS
 LEG_RANGE = math.radians(15.0)
+TARGET_BASE_HEIGHT = 0.28
 
 ##
 # Scene definition
@@ -102,6 +103,13 @@ class ActionsCfg:
         preserve_order=True,
         scale=10.0,
         use_default_offset=True,
+    )
+    gas_spring = mdp.GasSpringForceCfg(
+        asset_name="robot",
+        force=100.0,
+        damping=0.5,
+        max_force=150.0,
+        direction=-1.0,
     )
 
 @configclass
@@ -193,6 +201,14 @@ class RewardsCfg:
     roll_pitch_speed = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
 
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+
+    height_tracking = RewTerm(
+        func=mdp.base_height_l2,
+        weight=-10.0,
+        params={
+            "target_height": TARGET_BASE_HEIGHT,
+        },
+    )
 
 
 

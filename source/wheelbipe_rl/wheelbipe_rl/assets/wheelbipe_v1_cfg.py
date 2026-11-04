@@ -81,10 +81,21 @@ WHEELBIPE_V1_CFG = ArticulationCfg(
             damping=0.2,
             armature=0.003,
         ),
+        "spring": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "left_spring_slide_joint",
+                "right_spring_slide_joint",
+            ],
+            effort_limit_sim=250.0,
+            velocity_limit_sim=100.0,
+            stiffness=0.0,
+            damping=0.0,
+            armature=0.0,
+        ),
         # 显式声明其余关节为被动。
         "passive": ImplicitActuatorCfg(
             joint_names_expr=[
-                ".*_(knee|short|bellcrank|connecting|spring_mount|spring_slide)_joint",
+                ".*_(knee|short|bellcrank|connecting|spring_mount)_joint",
                 ".*_passive_wheel_[123]_joint",
             ],
             effort_limit_sim=0.0,
