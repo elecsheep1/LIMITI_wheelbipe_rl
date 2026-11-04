@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -23,8 +24,22 @@ from . import mdp
 # Pre-defined configs
 ##
 
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
-
+from wheelbipe_rl.assets import WHEELBIPE_V1_CFG
+HIP_JOINTS = [
+    "left_hip_joint",
+    "right_hip_joint",
+]
+KNEE_DRIVE_JOINTS = [
+    "left_knee_drive_joint",
+    "right_knee_drive_joint",
+]
+LEG_JOINTS = HIP_JOINTS + KNEE_DRIVE_JOINTS
+WHEEL_JOINTS = [
+    "left_wheel_joint",
+    "right_wheel_joint",
+]
+ACTIVE_JOINTS = LEG_JOINTS + WHEEL_JOINTS
+LEG_RANGE = math.radians(15.0)
 
 ##
 # Scene definition
@@ -38,11 +53,18 @@ class WheelbipeRlSceneCfg(InteractiveSceneCfg):
     # ground plane
     ground = AssetBaseCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
+        spawn=sim_utils.GroundPlaneCfg(
+            size=(100.0, 100.0),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.8,
+                dynamic_friction=0.8,
+                restitution=0.0,
+            ),
+        ),
     )
 
     # robot
-    robot: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = WHEELBIPE_V1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # lights
     dome_light = AssetBaseCfg(
@@ -60,8 +82,27 @@ class WheelbipeRlSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_effort = mdp.JointEffortActionCfg(asset_name="robot", joint_names=["slider_to_cart"], scale=100.0)
-
+    hips = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=HIP_JOINTS,
+        preserve_order=True,
+        scale=LEG_RANGE,
+        use_default_offset=True,
+    )
+    knee_drives = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=KNEE_DRIVE_JOINTS,
+        preserve_order=True,
+        scale=LEG_RANGE,
+        use_default_offset=True,
+    )
+    wheels = mdp.JointVelocityActionCfg(
+        asset_name="robot",
+        joint_names=WHEEL_JOINTS,
+        preserve_order=True,
+        scale=10.0,
+        use_default_offset=True,
+    )
 
 @configclass
 class ObservationsCfg:
@@ -72,8 +113,22 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        # base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        leg_joint_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINTS, preserve_order=True),
+            },
+        )
+        active_joint_vel = ObsTerm(
+            func=mdp.joint_vel_rel,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=ACTIVE_JOINTS, preserve_order=True),
+            },
+        )
+        previous_action = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -82,29 +137,41 @@ class ObservationsCfg:
     # observation groups
     policy: PolicyCfg = PolicyCfg()
 
+    @configclass
+    class HistoryCfg(PolicyCfg):
+        """Observations for history group."""
+
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.history_length = 5
+            self.flatten_history_dim = False
+            self.concatenate_terms = True
+            self.concatenate_dim = -1
+
+    history: HistoryCfg = HistoryCfg()
+
+    @configclass
+    class PrivilegedCfg(ObsGroup):
+        """Observations for privileged group."""
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    privileged :PrivilegedCfg = PrivilegedCfg()
+
 
 @configclass
 class EventCfg:
     """Configuration for events."""
 
     # reset
-    reset_cart_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
+    reset_scene = EventTerm(
+        func=mdp.reset_scene_to_default,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-            "position_range": (-1.0, 1.0),
-            "velocity_range": (-0.5, 0.5),
-        },
-    )
-
-    reset_pole_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
-            "position_range": (-0.25 * math.pi, 0.25 * math.pi),
-            "velocity_range": (-0.25 * math.pi, 0.25 * math.pi),
+            "reset_joint_targets": True,
         },
     )
 
@@ -113,41 +180,28 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # (1) Constant running reward
     alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    # (2) Failure penalty
-    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    # (3) Primary task: keep pole upright
-    pole_pos = RewTerm(
-        func=mdp.joint_pos_target_l2,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]), "target": 0.0},
-    )
-    # (4) Shaping tasks: lower cart velocity
-    cart_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"])},
-    )
-    # (5) Shaping tasks: lower pole angular velocity
-    pole_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.005,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
-    )
+
+    terminating = RewTerm(func=mdp.is_terminated, weight=-5.0)
+
+    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-3.0)
+
+    planar_speed = RewTerm(func=mdp.planar_speed_l2, weight=-1.0)
+
+    vertical_speed = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
+
+    roll_pitch_speed = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+
 
 
 @configclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
-    # (1) Time out
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # (2) Cart out of bounds
-    cart_out_of_bounds = DoneTerm(
-        func=mdp.joint_pos_out_of_manual_limit,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-3.0, 3.0)},
-    )
+    fallen = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": math.radians(60.0)})
 
 
 ##
@@ -158,7 +212,11 @@ class TerminationsCfg:
 @configclass
 class WheelbipeRlEnvCfg(ManagerBasedRLEnvCfg):
     # Scene settings
-    scene: WheelbipeRlSceneCfg = WheelbipeRlSceneCfg(num_envs=4096, env_spacing=4.0)
+    scene: WheelbipeRlSceneCfg = WheelbipeRlSceneCfg(
+        num_envs=4096,
+        env_spacing=4.0,
+        replicate_physics=False,
+    )
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -171,10 +229,11 @@ class WheelbipeRlEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         """Post initialization."""
         # general settings
-        self.decimation = 2
-        self.episode_length_s = 5
+        self.decimation = 10
+        self.episode_length_s = 10.0
         # viewer settings
         self.viewer.eye = (8.0, 0.0, 5.0)
         # simulation settings
-        self.sim.dt = 1 / 120
+        self.sim.dt = 0.002
         self.sim.render_interval = self.decimation
+        self.sim.gravity = (0.0, 0.0, -9.81)
