@@ -40,7 +40,7 @@ WHEEL_JOINTS = [
 ]
 ACTIVE_JOINTS = LEG_JOINTS + WHEEL_JOINTS
 LEG_RANGE = math.radians(15.0)
-TARGET_BASE_HEIGHT = 0.28
+TARGET_BASE_HEIGHT = 0.30
 
 ##
 # Scene definition
@@ -112,6 +112,27 @@ class ActionsCfg:
         direction=-1.0,
     )
 
+
+@configclass
+class CommandsCfg:
+    """Command specifications for the MDP."""
+
+    base_velocity = mdp.DeadzoneVelocityCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(5.0, 10.0),
+        rel_standing_envs=0.2,
+        heading_command=False,
+        rel_heading_envs=0.0,
+        debug_vis=False,
+        linear_deadzone=0.04,
+        yaw_deadzone=0.04,
+        ranges=mdp.DeadzoneVelocityCommandCfg.Ranges(
+            lin_vel_x=(-0.5, 0.5),
+            lin_vel_y=(0.0, 0.0),
+            ang_vel_z=(-0.5, 0.5),
+        ),
+    )
+
 @configclass
 class ObservationsCfg:
     """Observation specifications for the MDP."""
@@ -122,6 +143,7 @@ class ObservationsCfg:
 
         # observation terms (order preserved)
         # base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        velocity_command = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
         leg_joint_pos = ObsTerm(
@@ -194,8 +216,6 @@ class RewardsCfg:
 
     orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-3.0)
 
-    planar_speed = RewTerm(func=mdp.planar_speed_l2, weight=-1.0)
-
     vertical_speed = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
 
     roll_pitch_speed = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
@@ -204,13 +224,38 @@ class RewardsCfg:
 
     height_tracking = RewTerm(
         func=mdp.base_height_l2,
-        weight=-10.0,
+        weight=-20.0,
         params={
             "target_height": TARGET_BASE_HEIGHT,
         },
     )
 
+    track_linear_velocity = RewTerm(
+        func=mdp.track_lin_vel_xy_exp,
+        weight=2.0,
+        params={
+            "command_name": "base_velocity",
+            "std": 0.25,
+        },
+    )
 
+    track_yaw_velocity = RewTerm(
+        func=mdp.track_ang_vel_z_exp,
+        weight=1.0,
+        params={
+            "command_name": "base_velocity",
+            "std": 0.5,
+        },
+    )
+
+    low_speed_tracking = RewTerm(
+        func=mdp.low_speed_tracking_l1,
+        weight=-1.0,
+        params={
+            "command_name": "base_velocity",
+            "threshold": 0.1,
+        },
+    )
 
 @configclass
 class TerminationsCfg:
@@ -240,6 +285,7 @@ class WheelbipeRlEnvCfg(ManagerBasedRLEnvCfg):
     # MDP settings
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    commands: CommandsCfg = CommandsCfg()
 
     # Post initialization
     def __post_init__(self) -> None:

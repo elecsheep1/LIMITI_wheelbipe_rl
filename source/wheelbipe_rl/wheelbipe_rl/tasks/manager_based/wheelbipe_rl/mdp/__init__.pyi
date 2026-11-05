@@ -5,11 +5,14 @@
 
 __all__ = [
     "planar_speed_l2",
+    "low_speed_tracking_l1",
     "GasSpringForceCfg",
+    "DeadzoneVelocityCommandCfg",
 ]
 
 # Forward stable MDP terms lazily, then override with environment-specific terms below.
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from .rewards import planar_speed_l2
+from .rewards import planar_speed_l2, low_speed_tracking_l1
 from .gas_spring import GasSpringForceCfg
+from .commands_cfg import DeadzoneVelocityCommandCfg
