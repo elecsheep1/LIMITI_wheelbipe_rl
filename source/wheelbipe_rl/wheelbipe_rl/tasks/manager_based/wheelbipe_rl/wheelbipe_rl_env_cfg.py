@@ -224,7 +224,7 @@ class RewardsCfg:
 
     height_tracking = RewTerm(
         func=mdp.base_height_l2,
-        weight=-20.0,
+        weight=-50.0,
         params={
             "target_height": TARGET_BASE_HEIGHT,
         },
