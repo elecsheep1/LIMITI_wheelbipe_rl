@@ -10,12 +10,19 @@ __all__ = [
     "DeadzoneVelocityCommandCfg",
     "terrain_patch_boundary",
     "traversability_sampling",
+    "wheel_pair_alignment_l2",
+    "undesired_body_contacts",
 ]
 
 # Forward stable MDP terms lazily, then override with environment-specific terms below.
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from .rewards import planar_speed_l2, low_speed_tracking_l1
+from .rewards import (
+    planar_speed_l2,
+    low_speed_tracking_l1,
+    wheel_pair_alignment_l2,
+    undesired_body_contacts,
+)
 from .gas_spring import GasSpringForceCfg
 from .commands_cfg import DeadzoneVelocityCommandCfg
 from .terminations import terrain_patch_boundary

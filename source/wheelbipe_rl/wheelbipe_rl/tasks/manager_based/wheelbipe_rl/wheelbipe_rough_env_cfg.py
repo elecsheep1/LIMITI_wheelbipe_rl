@@ -5,6 +5,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.sensors import (
     RayCasterCfg,
     patterns,
@@ -77,7 +78,8 @@ class WheelbipeRoughEnvCfg(WheelbipeRlEnvCfg):
     scene: WheelbipeRoughSceneCfg = WheelbipeRoughSceneCfg(
         num_envs=4096,
         env_spacing=4.0,
-        replicate_physics=False,
+        replicate_physics=True,
+        filter_collisions=True,
     )
 
     curriculum: RoughCurriculumCfg = RoughCurriculumCfg()
@@ -85,6 +87,21 @@ class WheelbipeRoughEnvCfg(WheelbipeRlEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # 先由继承的 reset_scene 恢复关节与控制目标，
+        # 再随机化整个机器人根部的位置。
+        self.events.randomize_spawn = EventTerm(
+            func=mdp.reset_root_state_uniform,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "pose_range": {
+                    "x": (-0.5, 0.5),
+                    "y": (-0.5, 0.5),
+                },
+                "velocity_range": {},
+            },
+        )
 
         # 扫描器按控制频率更新。
         self.scene.height_scanner.update_period = (self.decimation * self.sim.dt)

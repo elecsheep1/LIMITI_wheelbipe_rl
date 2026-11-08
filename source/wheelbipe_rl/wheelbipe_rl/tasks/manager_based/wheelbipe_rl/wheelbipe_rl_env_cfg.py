@@ -16,9 +16,14 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils.configclass import configclass
 
 from . import mdp
+
+from wheelbipe_rl.assets.contact_reports import (
+    spawn_with_contact_reports,
+)
 
 ##
 # Pre-defined configs
@@ -41,6 +46,28 @@ WHEEL_JOINTS = [
 ACTIVE_JOINTS = LEG_JOINTS + WHEEL_JOINTS
 LEG_RANGE = math.radians(15.0)
 TARGET_BASE_HEIGHT = 0.30
+
+UNDESIRED_CONTACT_SENSORS = [
+    "base_contact",
+    "left_thigh_contact",
+    "right_thigh_contact",
+    "left_shank_contact",
+    "right_shank_contact",
+    "left_knee_drive_contact",
+    "right_knee_drive_contact",
+    "left_passive_wheel_1_contact",
+    "right_passive_wheel_1_contact",
+]
+def make_body_contact_sensor(relative_path: str,) -> ContactSensorCfg:
+    return ContactSensorCfg(
+        prim_path=(
+            "{ENV_REGEX_NS}/Robot/Geometry/"
+            + relative_path
+        ),
+        update_period=0.0,
+        history_length=3,
+        debug_vis=False,
+    )
 
 ##
 # Scene definition
@@ -67,10 +94,26 @@ class WheelbipeRlSceneCfg(InteractiveSceneCfg):
     # robot
     robot: ArticulationCfg = WHEELBIPE_V1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
+    base_contact = make_body_contact_sensor("base_link")
+    left_thigh_contact = make_body_contact_sensor("base_link/left_thigh_link")
+    right_thigh_contact = make_body_contact_sensor("base_link/right_thigh_link")
+    left_shank_contact = make_body_contact_sensor(
+        "base_link/left_thigh_link/"
+        "left_shank_link"
+    )
+    right_shank_contact = make_body_contact_sensor(
+        "base_link/right_thigh_link/"
+        "right_shank_link"
+)
+    left_knee_drive_contact = make_body_contact_sensor("base_link/left_knee_drive_link")
+    right_knee_drive_contact = make_body_contact_sensor("base_link/right_knee_drive_link")
+    left_passive_wheel_1_contact = make_body_contact_sensor("base_link/left_thigh_link/left_shank_link/left_passive_wheel_1_link")
+    right_passive_wheel_1_contact = make_body_contact_sensor("base_link/right_thigh_link/right_shank_link/right_passive_wheel_1_link")
+
     # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
+        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=1500.0),
     )
 
 
@@ -214,7 +257,7 @@ class RewardsCfg:
 
     terminating = RewTerm(func=mdp.is_terminated, weight=-5.0)
 
-    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-3.0)
+    orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-6.0)
 
     vertical_speed = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
 
@@ -224,7 +267,7 @@ class RewardsCfg:
 
     height_tracking = RewTerm(
         func=mdp.base_height_l2,
-        weight=-50.0,
+        weight=-100.0,
         params={
             "target_height": TARGET_BASE_HEIGHT,
         },
@@ -256,6 +299,54 @@ class RewardsCfg:
             "threshold": 0.1,
         },
     )
+
+    wheel_pair_x = RewTerm(
+        func=mdp.wheel_pair_alignment_l2,
+        weight=-1.0,
+        params={
+            "axis": "x",
+            "tolerance": 0.05,
+            "error_scale": 0.05,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=[
+                    "left_wheel_link",
+                    "right_wheel_link",
+                ],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    wheel_pair_z = RewTerm(
+        func=mdp.wheel_pair_alignment_l2,
+        weight=-0.5,
+        params={
+            "axis": "z",
+            "tolerance": 0.05,
+            "error_scale": 0.05,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=[
+                    "left_wheel_link",
+                    "right_wheel_link",
+                ],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    undesired_contact = RewTerm(
+        func=mdp.undesired_body_contacts,
+        weight=-2.0,
+        params={
+            "sensor_names": list(
+                UNDESIRED_CONTACT_SENSORS
+            ),
+            "threshold": 3.0,
+        },
+    )
+
 
 @configclass
 class TerminationsCfg:
@@ -299,3 +390,7 @@ class WheelbipeRlEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 0.002
         self.sim.render_interval = self.decimation
         self.sim.gravity = (0.0, 0.0, -9.81)
+
+        self.scene.robot.spawn.func = (spawn_with_contact_reports)
+        # 自定义生成函数会逐个启用嵌套刚体报告。
+        self.scene.robot.spawn.activate_contact_sensors = False

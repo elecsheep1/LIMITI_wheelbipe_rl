@@ -19,7 +19,7 @@ WHEELBIPE_V1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=str(WHEELBIPE_USD),
         variants={"Physics": "physx"},
-        activate_contact_sensors=True,
+        activate_contact_sensors=False,
 
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,

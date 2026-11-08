@@ -26,10 +26,10 @@ class TraversabilityCfg:
     # 出生或明显切换指令后的等待时间。
     grace_s: float = 0.5
     # 按有效运动时间划分窗口。
-    segment_s: float = 2.0
-    min_segment_s: float = 1.0
+    segment_s: float = 2.0              # 累计够 2 秒的有效运动步，就提交一段统计。
+    min_segment_s: float = 1.0          # 允许短失败窗口，防止早期跌倒被忽略。果指令改变或回合结束，当前窗口还没满 2 秒，只要已有至少 1 秒有效运动，也可以提交。
     # 成功步的沿指令方向速度范围。
-    progress_ratio: float = 0.5
+    progress_ratio: float = 0.5         # 0.5 * 指令速度 <= progress <= 1.5 * 指令速度 + 0.05
     max_progress_ratio: float = 1.5
     # rollout 为 24 步时，相当于约 100 轮 PPO。
     update_steps: int = 2400
@@ -51,11 +51,13 @@ class TerrainCurriculum:
     """
 
     def __init__(self, env, cfg):
+        # 保存环境和配置
         self.env = env
         self.cfg = cfg
         self.terrain = env.scene.terrain
         self.device = env.device
         self.dt = env.step_dt
+        # 保存地形生成器配置
         generator_cfg = self.terrain.cfg.terrain_generator
         self.rows = generator_cfg.num_rows
         self.cols = generator_cfg.num_cols
@@ -79,10 +81,10 @@ class TerrainCurriculum:
             shape,
             device=self.device,
         )
-        self.batch_n = torch.zeros_like(self.total)         # 当前批次的运动段数量
-        self.batch_score = torch.zeros_like(self.total)     # 当前批次的成功步数
-        self.batch_mid = torch.zeros_like(self.total)       # 当前批次的中间步数
-        self.batch_fall = torch.zeros_like(self.total)      # 当前批次的失败步数
+        self.batch_n = torch.zeros_like(self.total)         # 尚未用于更新估计的新运动段数量
+        self.batch_score = torch.zeros_like(self.total)     # 这些运动段的得分之和
+        self.batch_mid = torch.zeros_like(self.total)       # 得分落在 [lower, upper] 内的运动段数量
+        self.batch_fall = torch.zeros_like(self.total)      # 以失败终止的运动段数量
         # 各地形单元的平滑估计。
         self.score = torch.full(
             shape,
@@ -103,18 +105,28 @@ class TerrainCurriculum:
             dtype=torch.long,
         )
         # 每一列内，各难度行的采样概率。
+        """
+        [
+            [1, 1, 1, ..., 1],  # 第 0 级
+            [0, 0, 0, ..., 0],  # 第 1 级
+            [0, 0, 0, ..., 0],  # 第 2 级
+            [0, 0, 0, ..., 0],  # 第 3 级
+        ]
+        """
         self.probability = torch.zeros_like(self.total)
         self.probability[0] = 1.0
         self.next_update = int(env.common_step_counter) + cfg.update_steps      # 下一次更新的全局步数
+        # 将完整运动段时长换算成有效步数。
         self.full_steps = max(
             1,
             math.ceil(cfg.segment_s / self.dt),
         )
+        # 将最短保留时长换算为步数。
         self.minimum_steps = max(
             1,
             math.ceil(cfg.min_segment_s / self.dt),
         )
-
+        # 取得地形名称，顺序与配置字典一致
         keys = list(generator_cfg.sub_terrains)
         weights = torch.tensor(
             [
@@ -123,7 +135,9 @@ class TerrainCurriculum:
             ],
             device=self.device,
         )
-        cumulative = (weights / weights.sum()).cumsum(dim=0)
+        # 将权重变成区间边界
+        cumulative = (weights / weights.sum()).cumsum(dim=0)        # 归一化再求和
+        # 在 [0, 1) 区间内均匀采样，找到对应的地形类型（给每一列计算一个位置）
         column_choice = (
             torch.arange(
                 self.cols,
@@ -132,11 +146,13 @@ class TerrainCurriculum:
             / self.cols
             + 0.001
         )
+        # 对每个位置，找到第一个严格大于它的区间边界，返回该边界的索引。
         type_ids = torch.searchsorted(
             cumulative,
             column_choice,
             right=True,
         )
+        # 保存每列对应的地形类型名称
         self.column_names = [keys[int(index)] for index in type_ids.cpu()]
         self.flat_columns = torch.tensor(
             [
@@ -173,6 +189,7 @@ class TerrainCurriculum:
                 device=self.device,
                 dtype=torch.bool,
             )
+        # 取出这些环境当前积累的有效步数。
         count = self.nvalid[ids]
         # 普通窗口要求足够长。
         # 短失败窗口也保留，防止早期跌倒被忽略。
@@ -188,6 +205,7 @@ class TerrainCurriculum:
                 score,
             )
             mid = ((score >= self.cfg.lower) & (score <= self.cfg.upper)).float()
+            # 别取得每个环境所在的： level：难度行。 column：地形列。
             level = (
                 self.terrain
                 .terrain_levels[selected]
@@ -198,8 +216,10 @@ class TerrainCurriculum:
                 .terrain_types[selected]
                 .long()
             )
+            # 把二维坐标换成一维索引
             index = level * self.cols + column
             one = torch.ones_like(score)
+            # 把每个环境的运动段结果，加到它所在的地形统计表里
             updates = (
                 (self.total, one),
                 (self.batch_n, one),
@@ -276,69 +296,118 @@ class TerrainCurriculum:
         self.previous_command[ids] = 0
 
     def update(self):
-        """周期性更新统计估计和采样分布。"""
+        """
+        周期性更新统计估计和采样分布。
+        等数据够了再评价
+        每隔 update_steps 步检查一次。某块地形积累的运动段达到 min_segments，才更新它；不足的继续积累。
+
+        更新对各地形的能力判断
+        计算平均得分、适宜运动段比例和失败率，用移动平均平滑，避免一次表现好坏就大幅改变判断。
+
+        练好了才开放下一级
+        每列独立判断：当前最高开放等级得分够高、失败率够低，就再开放一级。已经开放的等级不会关闭。
+
+        安排后续练习
+        在已经开放的等级中，混合三种采样策略：
+        - 70%：重点练适合当前能力、失败率较低的等级。
+        - 20%：回顾较低等级，巩固已有能力。
+        - 10%：练当前最高开放等级，继续探索。
+        平地固定选第 0 级。
+
+        清理并保存
+        清空本次已经用于更新的批次数据，保留长期估计，并按配置保存课程状态。
+        """
         if self.env.common_step_counter < self.next_update:
             return
         self.next_update = int(self.env.common_step_counter) + self.cfg.update_steps
-        # 数据不足的单元继续积累，不清空。
+        # 判断哪些地形数据足够
         ready = self.batch_n >= self.cfg.min_segments
+        # 数据已经够了，而且以前还没有完成过估计。
         first = ready & (~self.estimated)
-
+        # 更新三种表现估计
         estimates = (
             (self.score, self.batch_score),
             (self.desirability, self.batch_mid),
             (self.fall_rate, self.batch_fall),
         )
         for estimate, summed in estimates:
+            # 计算本批平均值
             value = (summed / self.batch_n.clamp_min(1))
+            # ema平滑
             blended = torch.lerp(
                 estimate,
                 value,
                 self.cfg.ema_alpha,
             )
+            # 已有估计、数据足够：使用平滑结果。
             estimate[ready] = blended[ready]
+            # 第一次估计：直接使用本批值
             estimate[first] = value[first]
+        # 把本次完成估计的地形标记为 True，以前已经为 True 的保持不变
         self.estimated |= ready
+        # 更新每列的前沿等级：如果当前等级的可通行性足够高，且失败率足够低，就开放下一等级。
         columns = torch.arange(
             self.cols,
             device=self.device,
         )
+        # 每列目前最高开放到哪一级
         level = self.frontier
+        # 表示索引，# 第columns列的第level级
         mastered = (
             ready[level, columns]
             & (self.score[level, columns] > self.cfg.upper)
             & (self.fall_rate[level, columns] < self.cfg.max_fall_rate)
             & (~self.flat_columns)
         )
+        # 更新前沿等级，不能超过总行数减一（mastered布尔值转化为整数）
         self.frontier = (level + mastered.long()).clamp_max(self.rows - 1)
-
+        # 把所有等级编号排成一列
         levels = torch.arange(
             self.rows,
             device=self.device,
         )[:, None]
+        # 逐格判断这个等级是否已经开放
+        """
+        [
+            [0 <= 1, 0 <= 2, 0 <= 2],
+            [1 <= 1, 1 <= 2, 1 <= 2],
+            [2 <= 1, 2 <= 2, 2 <= 2],
+            [3 <= 1, 3 <= 2, 3 <= 2],
+        ]
+        allowed = tensor([
+            [True,  True,  True ],
+            [True,  True,  True ],
+            [False, True,  True ],
+            [False, False, False],
+        ])
+        """
         allowed = levels <= self.frontier[None, :]
         # 70%：适宜地形。
-        # 未充分评价的已开放单元保留一个探索先验。
+        # 给每个等级一个“值得重点练习”的初始权重
         focus = torch.where(
             self.estimated,
             self.desirability,
             0.1,
         )
+        # 调整权重，排除未开放等级
         focus = (
             (focus + 0.02)
             * (1 - self.fall_rate)
             * allowed
         )
+        # 归一化成概率分布
         focus /= (
             focus.sum(dim=0, keepdim=True)
             .clamp_min(1e-6)
         )
 
         # 20%：较低等级回顾。
+        # 选出低于当前最高开放等级的那些等级。
         easy = (
             allowed
             & (levels < self.frontier[None, :])
         ).float()
+        # 如果没有旧等级，就回顾第 0 级
         empty = easy.sum(dim=0) == 0
         easy[0, empty] = 1
         easy /= easy.sum(
@@ -347,6 +416,7 @@ class TerrainCurriculum:
         )
         # 10%：当前开放前沿。
         explore = (levels == self.frontier[None, :]).float()
+        # 混合三套方案，得到最终概率
         self.probability.copy_(
             0.7 * focus
             + 0.2 * easy
