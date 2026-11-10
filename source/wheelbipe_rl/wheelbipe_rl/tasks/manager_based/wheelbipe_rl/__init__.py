@@ -51,3 +51,24 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.dreamwaq_ppo_cfg:DreamWaQRunnerCfg",
     },
 )
+
+gym.register(
+    id="Template-Wheelbipe-DreamWaQ-Jump-v0",
+    entry_point=f"{__name__}.wheelbipe_jump_env:WheelbipeJumpEnv",
+
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.wheelbipe_jump_env_cfg:WheelbipeJumpEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.dreamwaq_ppo_cfg:DreamWaQRunnerCfg",
+    },
+)
+
+gym.register(
+    id="Template-Wheelbipe-DreamWaQ-Jump-Play-v0",
+    entry_point=f"{__name__}.wheelbipe_jump_env:WheelbipeJumpEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.wheelbipe_jump_env_cfg:WheelbipeJumpEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.dreamwaq_ppo_cfg:DreamWaQRunnerCfg",
+    },
+)

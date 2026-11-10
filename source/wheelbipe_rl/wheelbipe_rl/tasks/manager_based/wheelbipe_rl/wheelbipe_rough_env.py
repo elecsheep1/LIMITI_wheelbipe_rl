@@ -56,6 +56,8 @@ class WheelbipeRoughEnv(ManagerBasedRLEnv):
         self._curriculum_recorded.zero_()
         self._curriculum_in_step = True
 
+        tracker.validate_spawn()
+
         try:
             result = super().step(action)
 
@@ -112,6 +114,7 @@ class WheelbipeRoughEnv(ManagerBasedRLEnv):
                 tracker.end_episode(
                     ids,
                     terminated,
+                    record_outcome=False,
                 )
 
         # 原实现先执行 CurriculumManager，

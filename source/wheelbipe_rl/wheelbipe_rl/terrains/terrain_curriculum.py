@@ -41,6 +41,9 @@ class TraversabilityCfg:
     upper: float = 0.9
     # 开放更高等级时允许的最大失败率。
     max_fall_rate: float = 0.1
+    min_episodes: int = 30
+    # 用于排除明显错误的初始状态。
+    min_spawn_clearance: float = 0.10
 
 
 class TerrainCurriculum:
@@ -70,6 +73,13 @@ class TerrainCurriculum:
         self.nsuccess = torch.zeros_like(self.nvalid)       # 成功步数
         self.age = torch.zeros_like(self.nvalid)            # 运动段的累计时间
         self.command_age = torch.zeros_like(self.nvalid)    # 当前指令的累计时间
+        self.spawn_pending = torch.ones(
+            num_envs,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        self.spawn_valid = torch.zeros_like(self.spawn_pending)
+        self.episode_eligible = torch.zeros_like(self.spawn_pending)
         self.previous_command = torch.zeros(
             num_envs,
             3,
@@ -85,6 +95,12 @@ class TerrainCurriculum:
         self.batch_score = torch.zeros_like(self.total)     # 这些运动段的得分之和
         self.batch_mid = torch.zeros_like(self.total)       # 得分落在 [lower, upper] 内的运动段数量
         self.batch_fall = torch.zeros_like(self.total)      # 以失败终止的运动段数量
+        self.batch_episode_n = torch.zeros_like(self.total)
+        self.fall_estimated = torch.zeros(
+            shape,
+            device=self.device,
+            dtype=torch.bool,
+        )
         # 各地形单元的平滑估计。
         self.score = torch.full(
             shape,
@@ -179,31 +195,18 @@ class TerrainCurriculum:
             return all_ids[selection]
         return torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
 
-    def _flush(self, env_ids, failed=None):
+    def _flush(self, env_ids):
         """结束并提交指定环境的当前运动段。"""
         ids = self.ids(env_ids)
         if ids.numel() == 0: return
-        if failed is None:
-            failed = torch.zeros(
-                ids.numel(),
-                device=self.device,
-                dtype=torch.bool,
-            )
         # 取出这些环境当前积累的有效步数。
         count = self.nvalid[ids]
         # 普通窗口要求足够长。
         # 短失败窗口也保留，防止早期跌倒被忽略。
-        keep = ((count >= self.minimum_steps) | (failed & (count > 0)))
+        keep = count >= self.minimum_steps
         selected = ids[keep]
         if selected.numel():
-            failures = failed[keep]
             score = self.nsuccess[selected] / self.nvalid[selected].clamp_min(1)
-            # 跌倒终止的末窗口视为失败。
-            score = torch.where(
-                failures,
-                torch.zeros_like(score),
-                score,
-            )
             mid = ((score >= self.cfg.lower) & (score <= self.cfg.upper)).float()
             # 别取得每个环境所在的： level：难度行。 column：地形列。
             level = (
@@ -225,7 +228,6 @@ class TerrainCurriculum:
                 (self.batch_n, one),
                 (self.batch_score, score),
                 (self.batch_mid, mid),
-                (self.batch_fall, failures.float()),
             )
             for target, values in updates:
                 target.view(-1).scatter_add_(
@@ -256,13 +258,18 @@ class TerrainCurriculum:
         velocity = self.env.scene["robot"].data.root_lin_vel_b.torch[ids, :2]
         direction = cmd[:, :2] / speed.clamp_min(1e-6).unsqueeze(-1)
         progress = (velocity * direction).sum(dim=-1)
-        valid = (
-            (speed >= self.cfg.min_speed)
+        command_ok = (
+            self.spawn_valid[ids]
+            & (speed >= self.cfg.min_speed)
             & (cmd[:, 2].abs() <= self.cfg.max_yaw)
+            & torch.isfinite(cmd).all(dim=-1)
+        )
+        self.episode_eligible[ids] |= command_ok
+        valid = (
+            command_ok
             & (self.age[ids] >= self.cfg.grace_s)
             & (self.command_age[ids] >= self.cfg.grace_s)
             & torch.isfinite(velocity).all(dim=-1)
-            & torch.isfinite(cmd).all(dim=-1)
         )
         success = (
             (progress >= self.cfg.progress_ratio * speed)
@@ -284,13 +291,41 @@ class TerrainCurriculum:
         )
         self._flush(ids[full])
 
-    def end_episode(self, env_ids, terminated):
+    def end_episode(
+        self,
+        env_ids,
+        terminated,
+        record_outcome=True,
+    ):
         """回合结束，提交剩余运动段并清空环境统计。"""
         ids = self.ids(env_ids)
-        self._flush(
-            ids,
-            failed=terminated[ids],
-        )
+        self._flush(ids)
+        if record_outcome:
+            selected = ids[self.episode_eligible[ids]]
+
+            if selected.numel() > 0:
+                level = self.terrain.terrain_levels[selected].long()
+                column = self.terrain.terrain_types[selected].long()
+                index = level * self.cols + column
+
+                self.batch_episode_n.view(-1).scatter_add_(
+                    0,
+                    index,
+                    torch.ones(
+                        selected.numel(),
+                        device=self.device,
+                    ),
+                )
+
+                self.batch_fall.view(-1).scatter_add_(
+                    0,
+                    index,
+                    terminated[selected].float(),
+                )
+
+        self.spawn_pending[ids] = True
+        self.spawn_valid[ids] = False
+        self.episode_eligible[ids] = False
         self.age[ids] = 0
         self.command_age[ids] = 0
         self.previous_command[ids] = 0
@@ -328,7 +363,6 @@ class TerrainCurriculum:
         estimates = (
             (self.score, self.batch_score),
             (self.desirability, self.batch_mid),
-            (self.fall_rate, self.batch_fall),
         )
         for estimate, summed in estimates:
             # 计算本批平均值
@@ -345,6 +379,26 @@ class TerrainCurriculum:
             estimate[first] = value[first]
         # 把本次完成估计的地形标记为 True，以前已经为 True 的保持不变
         self.estimated |= ready
+        fall_ready = (
+            self.batch_episode_n >= self.cfg.min_episodes
+        )
+        fall_first = fall_ready & (~self.fall_estimated)
+
+        fall_value = (
+            self.batch_fall
+            / self.batch_episode_n.clamp_min(1.0)
+        )
+
+        fall_blended = torch.lerp(
+            self.fall_rate,
+            fall_value,
+            self.cfg.ema_alpha,
+        )
+
+        self.fall_rate[fall_ready] = fall_blended[fall_ready]
+        self.fall_rate[fall_first] = fall_value[fall_first]
+
+        self.fall_estimated |= fall_ready
         # 更新每列的前沿等级：如果当前等级的可通行性足够高，且失败率足够低，就开放下一等级。
         columns = torch.arange(
             self.cols,
@@ -355,6 +409,7 @@ class TerrainCurriculum:
         # 表示索引，# 第columns列的第level级
         mastered = (
             ready[level, columns]
+            & self.fall_estimated[level, columns]
             & (self.score[level, columns] > self.cfg.upper)
             & (self.fall_rate[level, columns] < self.cfg.max_fall_rate)
             & (~self.flat_columns)
@@ -429,9 +484,11 @@ class TerrainCurriculum:
             self.batch_n,
             self.batch_score,
             self.batch_mid,
-            self.batch_fall,
         ):
             buffer[ready] = 0
+
+        self.batch_episode_n[fall_ready] = 0
+        self.batch_fall[fall_ready] = 0
         log_dir = getattr(
             self.env.cfg,
             "log_dir",
@@ -475,11 +532,17 @@ class TerrainCurriculum:
             )
 
         probability = self.probability
+        fall_known = known & self.fall_estimated
+
+        mean_fall_rate = (
+            (self.fall_rate * fall_known).sum()
+            / fall_known.sum().clamp_min(1)
+        )
 
         return {
             "traversability": mean(self.score),
             "desirability": mean(self.desirability),
-            "fall_rate": mean(self.fall_rate),
+            "fall_rate": mean_fall_rate,
             "segments": self.total.sum(),
             "mean_level": (
                 self.terrain
@@ -502,6 +565,8 @@ class TerrainCurriculum:
             "batch_score",
             "batch_mid",
             "batch_fall",
+            "batch_episode_n",
+            "fall_estimated",
             "score",
             "desirability",
             "fall_rate",
@@ -515,6 +580,7 @@ class TerrainCurriculum:
         }
         state["column_names"] = self.column_names
         state["rows"] = self.rows
+        state["version"] = 2
 
         path = Path(path)
         path.parent.mkdir(
@@ -532,6 +598,11 @@ class TerrainCurriculum:
             map_location=self.device,
             weights_only=True,
         )
+        if state.get("version", 1) != 2:
+            raise ValueError(
+                "课程统计格式已改变，请使用新的课程统计，"
+                "不要加载旧 terrain_curriculum.pt。"
+            )
         if (
             state["rows"] != self.rows
             or (
@@ -546,3 +617,42 @@ class TerrainCurriculum:
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 getattr(self, key).copy_(value)
+
+    def validate_spawn(self):
+        ids = self.ids(
+            self.spawn_pending.nonzero(
+                as_tuple=False
+            ).squeeze(-1)
+        )
+        if ids.numel() == 0:
+            return
+
+        robot = self.env.scene["robot"]
+
+        root = robot.data.root_pos_w.torch[ids]
+        gravity = robot.data.projected_gravity_b.torch[ids]
+
+        hits = (
+            self.env.scene["height_scanner"]
+            .data.ray_hits_w.torch[ids, :, 2]
+        )
+
+        finite_hits = torch.where(
+            torch.isfinite(hits),
+            hits,
+            torch.full_like(hits, float("nan")),
+        )
+        ground = finite_hits.nanmedian(dim=1).values
+
+        self.spawn_valid[ids] = (
+            torch.isfinite(root).all(dim=-1)
+            & torch.isfinite(gravity).all(dim=-1)
+            & torch.isfinite(ground)
+            & (
+                root[:, 2] - ground
+                > self.cfg.min_spawn_clearance
+            )
+            & (-gravity[:, 2] > 0.5)
+        )
+
+        self.spawn_pending[ids] = False
