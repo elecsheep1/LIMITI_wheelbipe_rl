@@ -144,6 +144,22 @@ class WheelbipeJumpEnv(ManagerBasedRLEnv):
                 "Jump/max_clearance": (
                     state.max_clearance[env_ids].mean()
                 ),
+                "Jump/max_wheel_z_diff": (
+                    state.episode_max_wheel_z_diff[env_ids].mean()
+                ),
+                "Jump/push_max_vz": state.push_max_vz[env_ids].mean(),
+                "Jump/push_wheel_free_steps": (
+                    state.push_wheel_free_steps[env_ids].mean()
+                ),
+                "Jump/push_candidate_steps": (
+                    state.push_candidate_steps[env_ids].mean()
+                ),
+                "Jump/push_support_free_steps": (
+                    state.push_support_free_steps[env_ids].mean()
+                ),
+                "Jump/push_clearance_steps": (
+                    state.push_clearance_steps[env_ids].mean()
+                ),
             }
 
         super()._reset_idx(env_ids)

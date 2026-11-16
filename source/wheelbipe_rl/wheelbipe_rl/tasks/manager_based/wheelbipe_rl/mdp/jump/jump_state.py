@@ -2,6 +2,7 @@ import math
 
 import torch
 from isaaclab.utils.configclass import configclass
+from isaaclab.utils.math import quat_apply_inverse
 
 STAND = 0       # 双轮接触地面并稳定站立
 CROUCH = 1      # 下蹲，降低机体高度
@@ -16,9 +17,27 @@ class JumpCfg:
     crouch_height: float = 0.27                 # 下蹲阶段的参考高度。
 
     # 相对实际离地位置继续上升的机体高度。
-    target_height: float = 0.04
+    target_height: float = 0.08
     # 空中相对离地时缩短竖直腿长 2 cm，收腿奖励达到满分。
     leg_retraction_distance: float = 0.02
+    # 整次腾空期间左右主轮最大高度差不超过 2 cm。
+    max_wheel_z_diff_for_success: float = 0.02
+
+    # 机身轨迹。
+    gravity: float = 9.81
+    # 计划离地时的机身高度。
+    release_height: float = 0.30
+    # 根据实际下蹲高度计算蹬地时间后，再限制到此范围。
+    min_push_trajectory_time: float = 0.06
+    max_push_trajectory_time: float = 0.15
+    # 空中腿部轨迹。
+    tuck_duration: float = 0.08         # 空中收腿参考动作的持续时间。
+    extension_duration: float = 0.12    # 空中伸腿参考动作的持续时间
+
+    # 轨迹奖励容差。
+    trajectory_height_tolerance: float = 0.02       # 机身高度跟踪奖励的误差尺度
+    trajectory_velocity_tolerance: float = 0.30     # 轨迹速度跟踪奖励的误差尺度
+    wheel_z_trajectory_tolerance: float = 0.01      # 轮子竖直位置跟踪奖励的误差尺度
 
     stand_duration: float = 1.0                 # 每次跳跃前固定准备1秒。
     # stand_timeout: float = 3.0                  # 如果机器人在站立阶段超过 3 秒没有起跳，则判定为失败。
@@ -43,7 +62,7 @@ class JumpCfg:
     # 低于此值不能判定为有效跳跃。
     min_valid_rise: float = 0.01
     # 容差
-    height_tolerance: float = 0.015
+    height_tolerance: float = 0.01
 
 
 class JumpState:
@@ -85,10 +104,20 @@ class JumpState:
         self.peak_height = zeros()              # 本次跳跃过程中的最高高度。
         self.air_time = zeros()                 # 本次跳跃的有效腾空时间。
         self.peak_clearance = zeros()           # 本次跳跃中，左右轮间隙较小值的最大值
-        self.takeoff_leg_extension = zeros()    # 离地时的竖直腿长
+        self.max_wheel_z_diff = zeros()          # 当前跳跃的最大左右轮高度差
+        self.episode_max_wheel_z_diff = zeros()  # 本回合的最大左右轮高度差
+        self.wheel_pos_b = torch.zeros(n, 2, 3, device=device)              # 当前轮子在机器人自身坐标系下的位置
+        self.takeoff_wheel_pos_b = torch.zeros(n, 2, 3, device=device)      # 离地时的轮子在机器人自身坐标系下的位置
         self.max_air_time = zeros()             # episode 内最大的腾空时间
         self.max_clearance = zeros()            # episode 内最大的共同离地间隙
         self.airborne_sample = zeros(torch.bool)# 当前采样是否有效腾空
+
+        self.push_max_vz = zeros()
+        self.push_candidate_steps = zeros()
+        self.push_wheel_free_steps = zeros()
+        self.push_support_free_steps = zeros()
+        self.push_clearance_steps = zeros()
+        self.push_release_ready = zeros(torch.bool)
 
         self.has_taken_off = zeros(torch.bool)          # 记录每个环境是否已经起跳。
         self.failed = zeros(torch.bool)                 # 记录每个环境是否失败。
@@ -109,6 +138,21 @@ class JumpState:
         )
         self.reference_vz = zeros()
 
+        # 从进入PUSH开始连续累计，进入FLIGHT时不清零。
+        self.trajectory_time = zeros()
+        # 蹬地轨迹的起始和释放参数。
+        self.push_start_height = zeros()
+        self.reference_release_height = zeros()
+        self.reference_release_vz = zeros()
+        self.reference_push_time = zeros()
+        # 左右主轮共用同一条空中高度轨迹。
+        self.takeoff_wheel_z_b = zeros()        # 起跳时轮子在机身坐标系下的竖直位置
+        self.reference_wheel_z_b = torch.full(
+            (n, 2),
+            self.cfg.wheel_radius - self.cfg.stand_height,      # 站立时轮心在机身坐标系中位置
+            device=device,
+        )
+
         self.phase_durations = torch.tensor(
             [
                 self.cfg.stand_duration,
@@ -119,8 +163,6 @@ class JumpState:
             ],
             device=device,
         )
-
-        self.leg_extension = zeros()
 
     def reset(self,env_ids):
         self.phase[env_ids] = STAND
@@ -134,14 +176,27 @@ class JumpState:
             self.peak_height,
             self.air_time,
             self.peak_clearance,
-            self.takeoff_leg_extension,
             self.max_air_time,
             self.max_clearance,
             self.attempts,
             self.successes,
             self.max_rise,
             self.reference_vz,
-            self.leg_extension,
+            self.wheel_pos_b,
+            self.takeoff_wheel_pos_b,
+            self.max_wheel_z_diff,
+            self.episode_max_wheel_z_diff,
+            self.push_max_vz,
+            self.push_candidate_steps,
+            self.push_wheel_free_steps,
+            self.push_support_free_steps,
+            self.push_clearance_steps,
+            self.trajectory_time,
+            self.push_start_height,
+            self.reference_release_height,
+            self.reference_release_vz,
+            self.reference_push_time,
+            self.takeoff_wheel_z_b,
         ):
             value[env_ids] = 0.0
         for value in (
@@ -151,10 +206,16 @@ class JumpState:
             self.takeoff_event,
             self.landing_event,
             self.success_event,
+            self.push_release_ready,
         ):
             value[env_ids] = False
         self.target_height[env_ids] = self.cfg.target_height
         self.reference_height[env_ids] = self.cfg.stand_height
+        self.reference_vz[env_ids] = 0.0
+        self.reference_wheel_z_b[env_ids] = (
+            self.cfg.wheel_radius
+            - self.cfg.stand_height
+        )
 
     def height(self):
         return (
@@ -212,30 +273,55 @@ class JumpState:
         # 当前阶段时间
         self.time += dt
 
+        # 机身轨迹从PUSH开始连续计时，进入FLIGHT后不重置。
+        trajectory_active = (
+            (old_phase == PUSH)
+            | (old_phase == FLIGHT)
+        )
+        self.trajectory_time[trajectory_active] += dt
+
         height = self.height()
-        self.leg_extension.copy_(
-            self.robot.data.root_pos_w[:, 2]
-            - self.robot.data.body_pos_w[
-                :, self.wheel_ids, 2
-            ].mean(dim=-1)
+        wheel_delta_w = (
+            self.robot.data.body_pos_w[:, self.wheel_ids, :]
+            - self.robot.data.root_pos_w[:, None, :]
+        )
+        root_quat = self.robot.data.root_quat_w[:, None, :].expand(-1, 2, -1)
+        self.wheel_pos_b.copy_(
+            quat_apply_inverse(root_quat, wheel_delta_w)
         )
         vz = self.robot.data.root_lin_vel_w[:, 2]
         forces = self.wheel_forces()
         contact = forces > cfg.contact_force
         no_contact = (~contact).all(dim=-1)
+        main_wheels_free = no_contact.clone()
+        support_free = torch.ones(
+            self.env.num_envs,
+            dtype=torch.bool,
+            device=self.env.device,
+        )
         for sensor in self.support_sensors:
             force = torch.linalg.vector_norm(
                 sensor.data.net_forces_w.torch,
                 dim=-1,
             ).amax(dim=-1)
+            support_free &= force <= cfg.contact_force
 
-            no_contact &= force <= cfg.contact_force
+        no_contact &= support_free
 
         wheel_height = (
             self.robot.data.body_pos_w[:, self.wheel_ids, 2]
             - env.scene.env_origins[:, 2:3]
         )
         clearance = wheel_height - cfg.wheel_radius
+        clearance_ok = (
+            clearance > cfg.takeoff_clearance
+        ).all(dim=-1)
+
+        self.push_release_ready.copy_(
+            main_wheels_free
+            & support_free
+            & clearance_ok
+        )
 
         unsupported =(
             no_contact
@@ -247,7 +333,15 @@ class JumpState:
         # 设置默认参考值
         self.reference_height.fill_(cfg.stand_height)
         self.reference_vz.zero_()
-
+        # 非腾空阶段默认使用左右轮当前位置的平均值，
+        # 避免参考观测中出现无意义的零值。
+        current_symmetric_wheel_z = (
+            self.wheel_pos_b[:, :, 2]
+            .mean(dim=-1, keepdim=True)
+        )
+        self.reference_wheel_z_b.copy_(
+            current_symmetric_wheel_z.expand(-1, 2)     # 把平均值扩展成左右两份，并写入参考张量
+        )
 
         # 1. STAND：双轮支撑并站稳。
         stand = old_phase == STAND
@@ -274,7 +368,7 @@ class JumpState:
         self.peak_height[begin] = 0.0
         self.air_time[begin] = 0.0
         self.peak_clearance[begin] = 0.0
-        self.takeoff_leg_extension[begin] = 0.0
+        self.max_wheel_z_diff[begin] = 0.0
         self.attempts[begin] += 1.0
         self.enter(begin, CROUCH)
 
@@ -291,33 +385,144 @@ class JumpState:
             crouch_reference[crouch]
         )
 
-        self.enter(
-            crouch & (self.time >= cfg.crouch_duration),
-            PUSH,
+        start_push = crouch & (self.time >= cfg.crouch_duration)
+        # 保存实际开始蹬地时的机身高度。
+        self.push_start_height[start_push] = (
+            height[start_push]
+        )
+        # 为了在离地后继续上升target_height，
+        # 计算所需的离地竖直速度。根号2gh
+        release_vz = torch.sqrt(
+            2.0
+            * cfg.gravity
+            * self.target_height[start_push]
+        )
+        self.reference_release_vz[start_push] = release_vz
+        # 从实际下蹲高度运动到计划离地高度。
+        push_distance = (
+            cfg.release_height
+            - self.push_start_height[start_push]
+        ).clamp_min(0.0)
+        # 初速度为零、匀加速到离地速度的假设，计算所需的蹬地时间。
+        push_time = (
+            2.0
+            * push_distance
+            / release_vz.clamp_min(1.0e-6)
+        ).clamp(
+            cfg.min_push_trajectory_time,
+            cfg.max_push_trajectory_time,
+        )
+        self.reference_push_time[start_push] = push_time
+        # 使用实际受限后的push_time重新计算释放高度，
+        # 保证PUSH轨迹和FLIGHT轨迹连续。
+        self.reference_release_height[start_push] = (
+            self.push_start_height[start_push]
+            + 0.5
+            * release_vz            # 0.5 * vz ：平均速度
+            * push_time
         )
 
-        # 3. PUSH：参考向上速度逐渐增大。
+        # 从PUSH起点开始连续计时。
+        self.trajectory_time[start_push] = 0.0
+
+        self.enter(start_push, PUSH)
+
+        # 3. PUSH和FLIGHT共用一条连续机身轨迹。
         push = old_phase == PUSH
-        target_vz = torch.sqrt(
-            2.0 * 9.81 * self.target_height
-        )
-        ramp = (self.time / 0.15).clamp(0.0, 1.0)
-        # 在 0.15 秒内将蹬地参考速度从 0 平滑增加到目标速度。
-        self.reference_vz[push] = (target_vz * ramp)[push]
+        flight = old_phase == FLIGHT
+        trajectory_phase = push | flight
 
+        push_time = self.reference_push_time.clamp_min(dt)
+        elapsed = self.trajectory_time
+        push_elapsed = torch.minimum(elapsed, push_time)
+
+        push_acceleration = (
+            self.reference_release_vz / push_time
+        )
+
+        # PUSH阶段恒加速度轨迹。
+        push_height_ref = (
+            self.push_start_height
+            + 0.5
+            * push_acceleration
+            * push_elapsed.square()
+        )
+        push_vz_ref = push_acceleration * push_elapsed
+
+        # 计划释放后的自由飞行时间。
+        flight_elapsed = (elapsed - push_time).clamp_min(0.0)
+        flight_height_ref = (
+            self.reference_release_height
+            + self.reference_release_vz * flight_elapsed
+            - 0.5 * cfg.gravity * flight_elapsed.square()
+        )
+        flight_vz_ref = (
+            self.reference_release_vz
+            - cfg.gravity * flight_elapsed
+        )
+
+        still_pushing_reference = (
+            elapsed < push_time
+        )
+        trajectory_height_ref = torch.where(
+            still_pushing_reference,
+            push_height_ref,
+            flight_height_ref,
+        )
+        trajectory_vz_ref = torch.where(
+            still_pushing_reference,
+            push_vz_ref,
+            flight_vz_ref,
+        )
+
+        self.reference_height[trajectory_phase] = (
+            trajectory_height_ref[trajectory_phase]
+        )
+        self.reference_vz[trajectory_phase] = (
+            trajectory_vz_ref[trajectory_phase]
+        )
+
+        # 判断是否处于空中。
         airborne_candidate = (
             push
-            & unsupported
-            & (clearance > cfg.takeoff_clearance).all(dim=-1)
+            & self.push_release_ready
             & (vz > cfg.takeoff_min_vz)
         )
+
+        self.push_max_vz[push] = torch.maximum(
+            self.push_max_vz[push], vz[push]
+        )
+        self.push_wheel_free_steps += (
+            push & main_wheels_free
+        ).float()
+        self.push_candidate_steps += airborne_candidate.float()
+        self.push_support_free_steps += (
+            push & support_free
+        ).float()
+        self.push_clearance_steps += (
+            push & clearance_ok
+        ).float()
 
         first_air = airborne_candidate & (self.air_confirm_time == 0.0)
 
         self.takeoff_height[first_air] = height[first_air]
         self.takeoff_vz[first_air] = vz[first_air]
         self.peak_height[first_air] = height[first_air]     # 将当前高度作为初始最高高度.
-        self.takeoff_leg_extension[first_air] = self.leg_extension[first_air]
+        self.takeoff_wheel_pos_b[first_air] = self.wheel_pos_b[first_air]
+        # 左右轮使用共同的轨迹起点。
+        # 在刚离地时，给左右轮设置相同的空中轨迹起点
+        symmetric_takeoff_wheel_z = (
+            self.wheel_pos_b[first_air, :, 2]
+            .mean(dim=-1)
+        )
+        self.takeoff_wheel_z_b[first_air] = (
+            symmetric_takeoff_wheel_z
+        )
+        self.reference_wheel_z_b[first_air] = (
+            symmetric_takeoff_wheel_z
+            .unsqueeze(-1)
+            .expand(-1, 2)
+        )
         self.air_time[first_air] = 0.0
         self.peak_clearance[first_air] = 0.0
 
@@ -346,8 +551,66 @@ class JumpState:
                 & self.has_taken_off
             )
         )
+
         self.airborne_sample.copy_(airborne)
         self.air_time[airborne] += dt
+
+        # 根据计划离地速度计算最高点时间。
+        apex_time = (
+            self.reference_release_vz
+            / cfg.gravity
+        )
+        # 上升阶段，从离地位置向上收腿。tuck:收腿
+        tuck_ratio = (
+            self.air_time
+            /cfg.tuck_duration
+        ).clamp(0.0, 1.0)
+        tuck_smooth = (
+            tuck_ratio.square()
+            * (3.0 - 2.0 * tuck_ratio)
+        )
+        tucked_wheel_z_b = (
+            self.takeoff_wheel_z_b
+            + cfg.leg_retraction_distance
+        )
+        ascent_wheel_z_ref = (      #ascent:上升阶段
+            self.takeoff_wheel_z_b
+            + cfg.leg_retraction_distance
+            * tuck_smooth
+        )
+        # 计划越过最高点后，开始伸腿准备落地。
+        descent_time = (
+            self.air_time - apex_time
+        ).clamp_min(0.0)
+        extension_ratio = (
+            descent_time
+            / cfg.extension_duration
+        ).clamp(0.0, 1.0)
+        extension_smooth = (
+            extension_ratio.square()
+            * (3.0 - 2.0 * extension_ratio)
+        )
+        descent_wheel_z_ref = (
+            tucked_wheel_z_b
+            + (
+                self.takeoff_wheel_z_b
+                - tucked_wheel_z_b
+            )
+            * extension_smooth
+        )
+
+        wheel_z_reference = torch.where(
+            self.air_time <= apex_time,
+            ascent_wheel_z_ref,
+            descent_wheel_z_ref,
+        )
+        self.reference_wheel_z_b[flight] = (
+            wheel_z_reference[flight]
+            .unsqueeze(-1)
+            .expand(-1, 2)
+        )
+
+        # 更新本次腾空的最高点和最大间隙。
         self.peak_clearance[airborne] = torch.maximum(
             self.peak_clearance[airborne],
             clearance[airborne].amin(dim=-1),
@@ -356,6 +619,19 @@ class JumpState:
             self.peak_height[airborne],
             height[airborne],
         )
+        wheel_z_diff = (
+            self.wheel_pos_b[:, 0, 2]
+            - self.wheel_pos_b[:, 1, 2]
+        ).abs()
+        self.max_wheel_z_diff[airborne] = torch.maximum(
+            self.max_wheel_z_diff[airborne],
+            wheel_z_diff[airborne],
+        )
+        self.episode_max_wheel_z_diff[airborne] = torch.maximum(
+            self.episode_max_wheel_z_diff[airborne],
+            wheel_z_diff[airborne],
+        )
+
         confirmed = airborne & self.has_taken_off
         self.max_air_time[confirmed] = torch.maximum(
             self.max_air_time[confirmed],
@@ -367,7 +643,6 @@ class JumpState:
         )
 
         # 4. FLIGHT：重新接触主轮则进入落地阶段。
-        flight = old_phase == FLIGHT
         # 只要任意一个轮子重新检测到接触，就认为发生了触地。
         touchdown = flight & (~unsupported)
 
@@ -389,14 +664,15 @@ class JumpState:
         )
 
         rise = (self.peak_height - self.takeoff_height).clamp_min(0.0)
-        height_reached = (
-            (rise - self.target_height).abs()
-            <= cfg.height_tolerance
+        height_reached = rise >= torch.clamp_min(
+            self.target_height - cfg.height_tolerance,
+            cfg.min_valid_rise,
         )
         valid_jump = (
             self.has_taken_off
             & (rise >= cfg.min_valid_rise)
             & height_reached
+            & (self.max_wheel_z_diff <= cfg.max_wheel_z_diff_for_success)
         )
 
         success = (

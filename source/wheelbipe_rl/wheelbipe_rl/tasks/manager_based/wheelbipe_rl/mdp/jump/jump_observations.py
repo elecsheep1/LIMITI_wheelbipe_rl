@@ -16,12 +16,17 @@ def jump_observation(env):
         state.time / state.phase_durations[state.phase]
     ).clamp(0.0, 1.0)
 
-    # 新增 7 维观测。
+    # 5维阶段 + 目标高度 + 阶段进度
+    # + 参考机身高度 + 参考竖直速度
+    # + 左右轮参考高度，共11维。
     return torch.cat(
         [
             phase,
             state.target_height.unsqueeze(-1),
             progress.unsqueeze(-1),
+            state.reference_height.unsqueeze(-1),
+            state.reference_vz.unsqueeze(-1),
+            state.reference_wheel_z_b,
         ],
         dim=-1,
     )

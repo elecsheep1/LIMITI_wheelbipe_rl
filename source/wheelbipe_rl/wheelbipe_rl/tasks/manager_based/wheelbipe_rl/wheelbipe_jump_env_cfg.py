@@ -86,6 +86,9 @@ class WheelbipeJumpEnvCfg(WheelbipeRlEnvCfg):
 
         # 保留姿态、非期望接触和左右轮对齐。
         self.rewards.action_rate.weight = -0.005
+        # 跳跃任务需要比行驶任务更严格的左右轮高度同步。
+        self.rewards.wheel_pair_z.params["tolerance"] = 0.003
+        self.rewards.wheel_pair_z.params["error_scale"] = 0.01
 
         # 原地跳跃限制水平漂移。
         self.rewards.planar_drift = RewTerm(
@@ -98,9 +101,19 @@ class WheelbipeJumpEnvCfg(WheelbipeRlEnvCfg):
             weight=2.0,
         )
 
-        self.rewards.jump_push_velocity = RewTerm(
-            func=jump_rewards.jump_push_velocity,
-            weight=3.0,
+        self.rewards.trajectory_height = RewTerm(
+            func=jump_rewards.jump_trajectory_height,
+            weight=2.0,
+        )
+
+        self.rewards.trajectory_velocity = RewTerm(
+            func=jump_rewards.jump_trajectory_velocity,
+            weight=1.0,
+        )
+
+        self.rewards.jump_release = RewTerm(
+            func=jump_rewards.jump_release,
+            weight=2.0,
         )
 
         self.rewards.jump_takeoff = RewTerm(
@@ -118,9 +131,9 @@ class WheelbipeJumpEnvCfg(WheelbipeRlEnvCfg):
             weight=2.0,
         )
 
-        self.rewards.jump_retraction = RewTerm(
-            func=jump_rewards.jump_leg_retraction,
-            weight=0.3,
+        self.rewards.wheel_z_trajectory = RewTerm(
+            func=jump_rewards.jump_wheel_z_trajectory,
+            weight=2.0,
         )
 
         self.rewards.stand_vertical_velocity = RewTerm(
@@ -133,15 +146,24 @@ class WheelbipeJumpEnvCfg(WheelbipeRlEnvCfg):
             weight=-0.1,
         )
 
-        self.terminations.jump_failed = DoneTerm(
-            func=jump_failed,
-        )
-
         self.rewards.air_wheel_torque = RewTerm(
             func=jump_rewards.jump_air_wheel_torque_l2,
             weight=-0.05,
         )
 
+        self.rewards.wheel_forward_swing = RewTerm(
+            func=jump_rewards.jump_wheel_forward_swing,
+            weight=-0.2,
+        )
+
+        self.rewards.air_wheel_z_diff = RewTerm(
+            func=jump_rewards.jump_air_wheel_z_diff,
+            weight=-1.0,
+        )
+
+        self.terminations.jump_failed = DoneTerm(
+            func=jump_failed,
+        )
 
 @configclass
 class WheelbipeJumpEnvCfg_PLAY(WheelbipeJumpEnvCfg):
