@@ -86,9 +86,14 @@ class WheelbipeJumpEnvCfg(WheelbipeRlEnvCfg):
 
         # 保留姿态、非期望接触和左右轮对齐。
         self.rewards.action_rate.weight = -0.005
-        # 跳跃任务需要比行驶任务更严格的左右轮高度同步。
+        # 严格限制左右轮高度差。
         self.rewards.wheel_pair_z.params["tolerance"] = 0.003
         self.rewards.wheel_pair_z.params["error_scale"] = 0.01
+
+        # 严格限制左右轮前后错位，但允许同步前后运动。
+        self.rewards.wheel_pair_x.params["tolerance"] = 0.005
+        self.rewards.wheel_pair_x.params["error_scale"] = 0.01
+        self.rewards.wheel_pair_x.weight = -1.0
 
         # 原地跳跃限制水平漂移。
         self.rewards.planar_drift = RewTerm(
@@ -149,11 +154,6 @@ class WheelbipeJumpEnvCfg(WheelbipeRlEnvCfg):
         self.rewards.air_wheel_torque = RewTerm(
             func=jump_rewards.jump_air_wheel_torque_l2,
             weight=-0.05,
-        )
-
-        self.rewards.wheel_forward_swing = RewTerm(
-            func=jump_rewards.jump_wheel_forward_swing,
-            weight=-0.2,
         )
 
         self.rewards.air_wheel_z_diff = RewTerm(

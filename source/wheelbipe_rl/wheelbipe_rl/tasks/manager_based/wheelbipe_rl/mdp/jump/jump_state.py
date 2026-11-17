@@ -17,7 +17,7 @@ class JumpCfg:
     crouch_height: float = 0.27                 # 下蹲阶段的参考高度。
 
     # 相对实际离地位置继续上升的机体高度。
-    target_height: float = 0.08
+    target_height: float = 0.06
     # 空中相对离地时缩短竖直腿长 2 cm，收腿奖励达到满分。
     leg_retraction_distance: float = 0.02
     # 整次腾空期间左右主轮最大高度差不超过 2 cm。
@@ -46,7 +46,7 @@ class JumpCfg:
     flight_timeout: float = 0.90                # 已经起跳后，最多允许飞行 0.90 秒
     land_timeout: float = 1.50                  # 进入落地阶段后，最多等待 1.50 秒恢复稳定。
 
-    takeoff_confirm_time: float = 0.04          # 必须连续离地 0.04 秒。
+    takeoff_confirm_time: float = 0.02          # 必须连续离地 0.02 秒。
     landing_stable_time: float = 0.20           # 连续稳定 0.20 秒
 
     contact_force: float = 3.0
@@ -142,6 +142,7 @@ class JumpState:
         self.trajectory_time = zeros()
         # 蹬地轨迹的起始和释放参数。
         self.push_start_height = zeros()
+        self.push_start_vz = zeros()
         self.reference_release_height = zeros()
         self.reference_release_vz = zeros()
         self.reference_push_time = zeros()
@@ -193,6 +194,7 @@ class JumpState:
             self.push_clearance_steps,
             self.trajectory_time,
             self.push_start_height,
+            self.push_start_vz,
             self.reference_release_height,
             self.reference_release_vz,
             self.reference_push_time,
@@ -390,6 +392,10 @@ class JumpState:
         self.push_start_height[start_push] = (
             height[start_push]
         )
+        # 保存实际开始蹬地时的竖直速度。
+        self.push_start_vz[start_push] = (
+            vz[start_push]
+        )
         # 为了在离地后继续上升target_height，
         # 计算所需的离地竖直速度。根号2gh
         release_vz = torch.sqrt(
@@ -403,22 +409,24 @@ class JumpState:
             cfg.release_height
             - self.push_start_height[start_push]
         ).clamp_min(0.0)
-        # 初速度为零、匀加速到离地速度的假设，计算所需的蹬地时间。
+        # 基于匀加速到离地速度的假设，计算所需的蹬地时间。
+        average_vz = (
+            self.push_start_vz[start_push]
+            + release_vz
+        ) * 0.5
         push_time = (
-            2.0
-            * push_distance
-            / release_vz.clamp_min(1.0e-6)
+            push_distance
+            / average_vz.clamp_min(0.05)
         ).clamp(
             cfg.min_push_trajectory_time,
             cfg.max_push_trajectory_time,
         )
         self.reference_push_time[start_push] = push_time
-        # 使用实际受限后的push_time重新计算释放高度，
+        # 计算受蹬地时间限制后的计划释放高度。
         # 保证PUSH轨迹和FLIGHT轨迹连续。
         self.reference_release_height[start_push] = (
             self.push_start_height[start_push]
-            + 0.5
-            * release_vz            # 0.5 * vz ：平均速度
+            + average_vz
             * push_time
         )
 
@@ -427,32 +435,43 @@ class JumpState:
 
         self.enter(start_push, PUSH)
 
-        # 3. PUSH和FLIGHT共用一条连续机身轨迹。
+        # 3. PUSH跟踪蹬地参考，FLIGHT从实际离地高度生成弹道参考。
         push = old_phase == PUSH
         flight = old_phase == FLIGHT
-        trajectory_phase = push | flight
 
         push_time = self.reference_push_time.clamp_min(dt)
         elapsed = self.trajectory_time
         push_elapsed = torch.minimum(elapsed, push_time)
 
         push_acceleration = (
-            self.reference_release_vz / push_time
-        )
+            self.reference_release_vz - self.push_start_vz
+        ) / push_time
 
         # PUSH阶段恒加速度轨迹。
         push_height_ref = (
             self.push_start_height
+            + self.push_start_vz * push_elapsed
             + 0.5
             * push_acceleration
             * push_elapsed.square()
         )
-        push_vz_ref = push_acceleration * push_elapsed
+        push_vz_ref = (
+            self.push_start_vz
+            + push_acceleration * push_elapsed
+        )
 
-        # 计划释放后的自由飞行时间。
-        flight_elapsed = (elapsed - push_time).clamp_min(0.0)
+        # 计划蹬地结束后，保持计划释放高度和向上速度目标，
+        # 等待实际离地事件。
+        self.reference_height[push] = push_height_ref[push]
+        self.reference_vz[push] = push_vz_ref[push]
+        # time 在进入 FLIGHT 时清零。
+        # air_confirm_time 补偿首次离地采样到确认事件之间的时间。
+        flight_elapsed = (
+            self.time
+            + (self.air_confirm_time - dt).clamp_min(0.0)   # 确认离地造成的时间延迟补偿
+        )
         flight_height_ref = (
-            self.reference_release_height
+            self.takeoff_height
             + self.reference_release_vz * flight_elapsed
             - 0.5 * cfg.gravity * flight_elapsed.square()
         )
@@ -461,26 +480,8 @@ class JumpState:
             - cfg.gravity * flight_elapsed
         )
 
-        still_pushing_reference = (
-            elapsed < push_time
-        )
-        trajectory_height_ref = torch.where(
-            still_pushing_reference,
-            push_height_ref,
-            flight_height_ref,
-        )
-        trajectory_vz_ref = torch.where(
-            still_pushing_reference,
-            push_vz_ref,
-            flight_vz_ref,
-        )
-
-        self.reference_height[trajectory_phase] = (
-            trajectory_height_ref[trajectory_phase]
-        )
-        self.reference_vz[trajectory_phase] = (
-            trajectory_vz_ref[trajectory_phase]
-        )
+        self.reference_height[flight] = flight_height_ref[flight]
+        self.reference_vz[flight] = flight_vz_ref[flight]
 
         # 判断是否处于空中。
         airborne_candidate = (
@@ -535,6 +536,22 @@ class JumpState:
         self.takeoff_event[takeoff] = True
         self.has_taken_off[takeoff] = True
         self.enter(takeoff, FLIGHT)
+
+        # 确认起跳当步，让输出观测使用飞行参考。
+        flight_elapsed_at_takeoff = (
+            self.air_confirm_time[takeoff] - dt
+        ).clamp_min(0.0)
+        self.reference_height[takeoff] = (
+            self.takeoff_height[takeoff]
+            + self.reference_release_vz[takeoff]
+            * flight_elapsed_at_takeoff
+            - 0.5 * cfg.gravity
+            * flight_elapsed_at_takeoff.square()
+        )
+        self.reference_vz[takeoff] = (
+            self.reference_release_vz[takeoff]
+            - cfg.gravity * flight_elapsed_at_takeoff
+        )
 
         self.failed |= (
             push
